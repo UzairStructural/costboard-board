@@ -1,15 +1,31 @@
 // The Cost Board dashboard: pure view-model functions. No DOM, no network, no timers.
 //
-// Everything the page renders is derived here from (projection, deltas, rows, flags, now) so that it
-// can be unit-tested with `node --test dashboard/view-model.test.mjs`. app.js only maps this model
-// onto element ids.
+// buildModel(...) returns a flat object { <binding name>: { text, tone? } }. index.html carries one element per
+// name (data-bind="<name>"); app.js copies `text` into textContent, `tone` into data-tone, and sets the hidden
+// attribute when `text` is null. BINDINGS is the list of every name; BINDINGS.md documents each one.
+//
+// Tones: 'slipped' | 'closer' | 'unchanged' | 'never'. The style block in index.html maps them to colour tokens.
+// Visible words are limited to data values (dates, money, signed days, NEVER), the engine's basis string,
+// ACCRUAL_RULE_TEXT, the owner's labels (LABELS), the weekly_summaries row and errorDisplay() values.
 
-import { Constants, Gaps, GOALS, fmtDate, fmtMoney, lastLogAt as engineLastLogAt, zoned } from './engine.js';
+import {
+  Constants,
+  GOALS,
+  Gaps,
+  fmtDate,
+  fmtDelta,
+  fmtMoney,
+  formatDeltaDays,
+  lastLogAt as engineLastLogAt,
+  project,
+  sinceInstall as engineSinceInstall,
+  sinceMonday as engineSinceMonday,
+} from './engine.js';
 
 export const VOICE_EVENT_STALE_MS = 90 * 60 * 1000; // a voice_events row this old no longer blocks a new line
-export const VOICE_MIN_INTERVAL_MS = 5 * 60 * 1000; // never more than one voice-line request per 5 min per page
+export const VOICE_MIN_INTERVAL_MS = 5 * 60 * 1000; // at most one voice-line request per 5 min per page
 export const POLL_INTERVAL_MS = 60 * 1000;
-export const WEEKLY_ROTATE_MS = 12 * 1000; // the weekly summary shows one sentence at a time, this long each
+export const WEEKLY_ROTATE_MS = 12 * 1000; // the weekly summary is shown one sentence at a time, this long each
 export const MOCK_PORT = '8787';
 
 // ---------------------------------------------------------------------------------------------
@@ -17,7 +33,7 @@ export const MOCK_PORT = '8787';
 // ---------------------------------------------------------------------------------------------
 /**
  * Parse the page's query string into flags.
- *   ?kiosk=1        numbers and labels only (hides captions, weekly summary, footer status/updated)
+ *   ?kiosk=1        numbers and their labels only (hides the accrual rule, the weekly summary and status.error)
  *   ?tv=tv1|tv2     identity of this TV for voice dedupe (default "tv")
  *   ?voice=0        mute this TV
  *   ?zone=<IANA>    override settings.zone
@@ -54,23 +70,24 @@ export function isValidZone(zone) {
 /**
  * Decide where the REST + function calls go.
  *   mock flag  -> the page's own origin, key "mock"
- *   otherwise  -> window.COSTBOARD from config.js (must have a non-blank URL and key)
- * Returns { ok, base, key, reason }.
+ *   otherwise  -> window.COSTBOARD from config.js (must have a non-blank http(s) URL and a key)
+ * Returns { ok, base, key, reason }. `reason` is for the console only; it is our own wording, so it never reaches
+ * the screen (status.error shows only errorDisplay() values).
  */
 export function resolveApi(config, flags, origin = '') {
   if (flags && flags.mock) {
     return { ok: true, base: stripSlash(origin), key: (config && config.SUPABASE_ANON_KEY) || 'mock', reason: null };
   }
   if (!config || typeof config !== 'object') {
-    return { ok: false, base: null, key: null, reason: 'config.js is missing. Copy config.example.js to config.js and fill in SUPABASE_URL and SUPABASE_ANON_KEY.' };
+    return { ok: false, base: null, key: null, reason: 'config.js: window.COSTBOARD is not defined' };
   }
   const base = String(config.SUPABASE_URL || '').trim();
   const key = String(config.SUPABASE_ANON_KEY || '').trim();
   if (!base || !key) {
-    return { ok: false, base: null, key: null, reason: 'config.js is blank. Fill in SUPABASE_URL and SUPABASE_ANON_KEY.' };
+    return { ok: false, base: null, key: null, reason: 'config.js: SUPABASE_URL or SUPABASE_ANON_KEY is blank' };
   }
   if (!/^https?:\/\//i.test(base)) {
-    return { ok: false, base: null, key: null, reason: 'SUPABASE_URL in config.js must start with http:// or https://.' };
+    return { ok: false, base: null, key: null, reason: 'config.js: SUPABASE_URL is not an http(s) URL' };
   }
   return { ok: true, base: stripSlash(base), key, reason: null };
 }
@@ -86,6 +103,16 @@ export function restHeaders(key) {
     'Content-Type': 'application/json',
     Prefer: 'return=representation',
   };
+}
+
+/**
+ * What status.error may show for a failed poll. Only values that are data, never our own wording:
+ *   err.display, set by app.js to the HTTP status code of a failed response ("503") or to the platform's own
+ *   exception text from fetch() / res.json() ("TypeError: Failed to fetch").
+ * Anything else (configuration errors, unexpected shapes, engine exceptions) returns null: console only.
+ */
+export function errorDisplay(err) {
+  return err && typeof err.display === 'string' && err.display !== '' ? err.display : null;
 }
 
 /** The five GET calls of one poll, relative to `<base>/rest/v1/`. */
@@ -126,74 +153,105 @@ export function effectiveZone(flags, settings, browserZone) {
   return 'UTC';
 }
 
-/** Effective tracking start: settings.tracking_start when it is a YYYY-MM-DD string, else null (engine falls back to the first log). */
+/** settings.tracking_start when it is a YYYY-MM-DD string, else null (project() then chooses its own anchor). */
 export function effectiveTrackingStart(settings) {
   const v = settings && settings.tracking_start;
   return typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null;
 }
 
 // ---------------------------------------------------------------------------------------------
-// Deltas -> colour language
+// Engine state for one poll
 // ---------------------------------------------------------------------------------------------
 /**
- * One goal/date delta (from engine.compare) -> what the page shows next to the date.
- *   tone: 'red' (slipped / NEVER), 'green' (closer / back from NEVER), 'muted' (no change / no baseline)
- *   arrow: '▲' later, '▼' earlier, '' otherwise
+ * Everything the page derives from one poll, using the engine API exactly:
+ *   projection   = project(entries, now, zone, settings.tracking_start)
+ *   sinceInstall = sinceInstall(projection, zone)
+ *   sinceMonday  = sinceMonday(projection, snapshots, zone)
  */
-export function deltaView(delta) {
-  if (!delta) return { text: '', arrow: '', tone: 'muted', label: 'no baseline' };
-  if (delta.toNever) return { text: 'NEVER', arrow: '', tone: 'red', label: 'now never' };
-  if (delta.fromNever) return { text: 'back from NEVER', arrow: '▼', tone: 'green', label: 'back from never' };
-  if (delta.days == null) return { text: '', arrow: '', tone: 'muted', label: 'no baseline' };
-  if (delta.days === 0) return { text: 'no change', arrow: '', tone: 'muted', label: 'no change' };
-  const n = Math.abs(delta.days);
-  const unit = n === 1 ? 'day' : 'days';
-  if (delta.days > 0) return { text: `${n} ${unit}`, arrow: '▲', tone: 'red', label: `${n} ${unit} later than Monday` };
-  return { text: `${n} ${unit}`, arrow: '▼', tone: 'green', label: `${n} ${unit} closer than Monday` };
-}
-
-/** Tone for a projected date on its own: NEVER is red, anything else neutral. */
-export function dateTone(iso) {
-  return iso == null ? 'red' : 'neutral';
-}
-
-/** Tone for the cumulative loss: red while any target hour is unpaid (landing has slipped), neutral at $0. */
-export function lossTone(skippedHours) {
-  return (Number(skippedHours) || 0) > 0 ? 'red' : 'neutral';
-}
-
-/** The sentence to show at rotation step `index` (wraps; empty string when there is none). */
-export function weeklySentence(sentences, index) {
-  if (!Array.isArray(sentences) || !sentences.length) return '';
-  const n = sentences.length;
-  const i = ((Math.trunc(Number(index) || 0) % n) + n) % n;
-  return sentences[i];
+export function deriveState({ entries, snapshots, settings, flags, now, browserZone }) {
+  const zone = effectiveZone(flags, settings, browserZone);
+  const projection = project(Array.isArray(entries) ? entries : [], now, zone, effectiveTrackingStart(settings));
+  return {
+    zone,
+    projection,
+    sinceInstall: engineSinceInstall(projection, zone),
+    sinceMonday: engineSinceMonday(projection, Array.isArray(snapshots) ? snapshots : [], zone),
+  };
 }
 
 // ---------------------------------------------------------------------------------------------
-// Render model
+// Tones
 // ---------------------------------------------------------------------------------------------
+export const TONES = Object.freeze(['slipped', 'closer', 'unchanged', 'never']);
+
+/** Tone of a signed day count: > 0 slipped, < 0 closer, 0 / null unchanged; `never` wins. */
+export function daysTone(days, never = false, back = false) {
+  if (never) return 'never';
+  if (back) return 'closer';
+  if (days == null || days === 0) return 'unchanged';
+  return days > 0 ? 'slipped' : 'closer';
+}
+
+/** Tone of an engine DateDelta ({ days, toNever, fromNever }). */
+export function driftTone(delta) {
+  if (!delta) return 'unchanged';
+  return daysTone(delta.days, !!delta.toNever, !!delta.fromNever);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Labels and binding names
+// ---------------------------------------------------------------------------------------------
+/** The owner's words, and nothing else. */
+export const LABELS = Object.freeze({
+  brother: "Brother's tuition",
+  india_house: 'House in India',
+  marriage: 'Marriage',
+  us_house: 'House in US',
+  partner: "Partner's tuition",
+  nclc7: 'NCLC 7',
+  landing: 'Canada landing',
+  frenchTotal: 'of 1,000 h',
+  year30: 'Year-30 north star',
+});
+
+/** The four goals in engine order, then the partner's tuition. */
+export const GOAL_KEYS = Object.freeze([...GOALS.map((g) => g.key), Constants.PLAN_KEY_PARTNER]);
+
+/** Every binding name, in page order. */
+export const BINDINGS = Object.freeze([
+  'cost.cumulative',
+  'cost.accrualRule',
+  ...GOAL_KEYS.flatMap((k) => [
+    `label.${k}`,
+    `goal.${k}.projected`,
+    `goal.${k}.plan`,
+    `goal.${k}.driftPlan`,
+    `goal.${k}.driftMonday`,
+  ]),
+  'drift.sinceInstall',
+  'french.banked',
+  'label.frenchTotal',
+  'label.nclc7',
+  'french.nclc7',
+  'label.landing',
+  'french.landing',
+  'french.basis',
+  'weekly.summary',
+  'label.year30',
+  'footer.year30',
+  'status.error',
+]);
+
+// ---------------------------------------------------------------------------------------------
+// Formatting
+// ---------------------------------------------------------------------------------------------
+/** 33 -> "33", 1.5 -> "1.5", 13.98 -> "14". */
 export function fmtHours(h) {
   const n = Number(h) || 0;
   return Number.isInteger(n) ? String(n) : n.toFixed(1).replace(/\.0$/, '');
 }
 
-export function fmtRate(r) {
-  return `${(Number(r) || 0).toFixed(1)} h/day`;
-}
-
-export function fmtClock(ms, zone) {
-  const z = zoned(ms, zone);
-  return `${String(z.h).padStart(2, '0')}:${String(z.mi).padStart(2, '0')}`;
-}
-
-export function fmtSkipped(h) {
-  const n = Number(h) || 0;
-  const s = fmtHours(n);
-  return `${s} French hour${n === 1 ? '' : 's'} skipped`;
-}
-
-/** Split the weekly summary into its sentences (defensive: the row is free text from Claude). */
+/** Split the weekly summary into its sentences (defensive: the row is free text). */
 export function splitSentences(text) {
   if (typeof text !== 'string') return [];
   return text
@@ -204,88 +262,96 @@ export function splitSentences(text) {
     .filter(Boolean);
 }
 
+/** The sentence at rotation step `index` (wraps); null when there is none. */
+export function weeklySentence(sentences, index) {
+  if (!Array.isArray(sentences) || !sentences.length) return null;
+  const n = sentences.length;
+  const i = ((Math.trunc(Number(index) || 0) % n) + n) % n;
+  return sentences[i];
+}
+
+// ---------------------------------------------------------------------------------------------
+// Render model
+// ---------------------------------------------------------------------------------------------
+const value = (text, tone) => (tone === undefined ? { text } : { text, tone });
+const hidden = () => ({ text: null });
+
 /**
- * Build the whole render model.
- *   projection : engine.project(...)
- *   deltas     : engine.compare(projection, baseline)
- *   weekly     : latest weekly_summaries row or null
- *   status     : { ok: boolean, error: string|null, updatedAt: ms|null }
- *   flags      : parseFlags(...)
- *   now        : ms
+ * Build the flat render model.
+ *   projection   : engine project(...) result, or null before the first successful poll
+ *   sinceInstall : engine sinceInstall(projection, zone)
+ *   sinceMonday  : engine sinceMonday(projection, snapshots, zone)
+ *   weekly       : latest weekly_summaries row or null
+ *   weeklyIndex  : which sentence of the weekly summary is on screen
+ *   status       : { ok, error }
+ *   flags        : parseFlags(...)
+ * Returns { name: { text, tone? } } with exactly the keys in BINDINGS. `text: null` means hidden.
  */
-export function buildModel({ projection, deltas, weekly, status, flags, now }) {
-  const zone = projection.zone;
-  // engine.compare(p, null) marks every date "fromNever"; without a Monday baseline there is nothing
-  // to compare against, so every delta renders muted instead.
-  const hasBaseline = !!(deltas && deltas.hasBaseline);
-  const goalsByKey = new Map((hasBaseline ? deltas.goals : []).map((g) => [g.key, g]));
-  const goals = GOALS.map((g) => {
-    const p = projection.goals.find((x) => x.key === g.key) || { fundedOn: null };
-    const d = goalsByKey.get(g.key) || null;
-    return {
-      key: g.key,
-      label: g.label,
-      date: fmtDate(p.fundedOn),
-      dateTone: dateTone(p.fundedOn),
-      delta: deltaView(d),
-    };
-  });
-  const partner = {
-    key: 'partner_tuition',
-    label: "Partner's tuition",
-    date: fmtDate(projection.partnerTuitionPaidOff),
-    dateTone: 'muted',
-  };
-  const nclc7 = {
-    label: 'NCLC 7',
-    date: fmtDate(projection.projectedNclc7),
-    dateTone: dateTone(projection.projectedNclc7),
-    delta: deltaView(hasBaseline ? deltas.nclc7 : null),
-  };
-  const landing = {
-    label: 'Canada landing',
-    date: fmtDate(projection.projectedLanding),
-    dateTone: dateTone(projection.projectedLanding),
-    delta: deltaView(hasBaseline ? deltas.landing : null),
-  };
-  const sentences = weekly ? splitSentences(weekly.summary) : [];
+export function buildModel({ projection = null, sinceInstall = null, sinceMonday = null, weekly = null, weeklyIndex = 0, status = null, flags = null } = {}) {
   const kiosk = !!(flags && flags.kiosk);
-  return {
-    kiosk,
-    loss: {
-      figure: fmtMoney(projection.cumulativeLoss),
-      tone: lossTone(projection.skippedFrenchHours),
-      since: projection.trackingStart ? `since ${fmtDate(projection.trackingStart)}` : 'no tracking start yet',
-      skipped: fmtSkipped(projection.skippedFrenchHours),
-      showCaptions: !kiosk,
-    },
-    goals,
-    partner,
-    french: {
-      banked: `${fmtHours(projection.frenchHoursBanked)} of ${Constants.TOTAL_FRENCH_HOURS_NEEDED.toLocaleString('en-US')} h`,
-      rate: `${fmtRate(projection.frenchTrailingDailyRate)} (7-day)`,
-      nclc7,
-      landing,
-    },
-    weekly: {
-      show: !kiosk && sentences.length > 0,
-      sentences,
-    },
-    footer: {
-      year30: `Year-30 north star: ${fmtMoney(projection.year30Loss)}`,
-      showUpdated: !kiosk,
-      updated: status && status.updatedAt != null ? `updated ${fmtClock(status.updatedAt, zone)}` : 'waiting for first update',
-      ok: !!(status && status.ok),
-      error: status && !status.ok && status.error ? String(status.error) : '',
-      showError: !kiosk && !!(status && !status.ok && status.error),
-    },
-    headline: {
-      never: hasBaseline && !!deltas.headlineNever,
-      days: hasBaseline ? deltas.headlineDays : null,
-    },
-    now,
-    zone,
-  };
+  const out = {};
+  for (const name of BINDINGS) out[name] = hidden();
+
+  const error = status && !status.ok && status.error ? String(status.error) : null;
+  out['status.error'] = value(kiosk ? null : error);
+
+  if (!projection) return out;
+  const p = projection;
+
+  out['cost.cumulative'] = value(fmtMoney(p.cumulativeLoss));
+  out['cost.accrualRule'] = value(kiosk ? null : Constants.ACCRUAL_RULE_TEXT);
+
+  const mondayByKey = new Map((sinceMonday ? sinceMonday.goals : []).map((d) => [d.key, d]));
+  for (const key of GOAL_KEYS) {
+    const isPartner = key === Constants.PLAN_KEY_PARTNER;
+    const g = isPartner ? null : p.goals.find((x) => x.key === key);
+    const projected = isPartner ? p.partnerTuitionPaidOff : g ? g.fundedOn : null;
+    const planDate = isPartner ? p.partnerTuitionPlanDate : g ? g.planDate : null;
+    const planDeltaDays = isPartner ? p.partnerTuitionPlanDeltaDays : g ? g.planDeltaDays : null;
+    const monday = isPartner ? (sinceMonday ? sinceMonday.partner : null) : mondayByKey.get(key) || null;
+    const never = projected == null;
+
+    out[`label.${key}`] = value(LABELS[key]);
+    out[`goal.${key}.projected`] = never ? value(fmtDate(null), 'never') : value(fmtDate(projected));
+    out[`goal.${key}.plan`] = value(planDate == null ? null : fmtDate(planDate));
+    out[`goal.${key}.driftPlan`] = value(formatDeltaDays(never ? null : planDeltaDays, never, false), daysTone(never ? null : planDeltaDays, never));
+    out[`goal.${key}.driftMonday`] = value(mondayDriftText(monday), driftTone(monday));
+  }
+
+  if (sinceInstall) {
+    const never = !!sinceInstall.headlineNever;
+    out['drift.sinceInstall'] = value(formatDeltaDays(never ? null : sinceInstall.aggregateDays, never, false), daysTone(sinceInstall.aggregateDays, never));
+  }
+
+  out['french.banked'] = value(fmtHours(p.frenchHoursBanked));
+  out['label.frenchTotal'] = value(LABELS.frenchTotal);
+  out['label.nclc7'] = value(LABELS.nclc7);
+  out['french.nclc7'] = value(fmtDate(p.projectedNclc7), dateTone(p.projectedNclc7, sinceMonday ? sinceMonday.nclc7 : null));
+  out['label.landing'] = value(LABELS.landing);
+  out['french.landing'] = value(fmtDate(p.projectedLanding), dateTone(p.projectedLanding, sinceMonday ? sinceMonday.landing : null));
+  out['french.basis'] = value(p.frenchBasisLabel || null);
+
+  const sentences = weekly ? splitSentences(weekly.summary) : [];
+  out['weekly.summary'] = value(kiosk ? null : weeklySentence(sentences, weeklyIndex));
+
+  out['label.year30'] = value(LABELS.year30);
+  out['footer.year30'] = value(fmtMoney(p.year30Loss));
+  return out;
+}
+
+/**
+ * Drift-since-Monday text. The engine's formatDeltaDays says "back" when a date returns from NEVER; that word is not
+ * in the owner's copy, so such a delta (and a missing one) is hidden instead.
+ */
+export function mondayDriftText(delta) {
+  if (!delta || delta.fromNever) return null;
+  return fmtDelta(delta);
+}
+
+/** NCLC 7 and landing dates: NEVER is 'never'; otherwise the tone of their drift since Monday. */
+function dateTone(iso, mondayDelta) {
+  if (iso == null) return 'never';
+  return driftTone(mondayDelta);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -331,7 +397,7 @@ export function lastLogMs(entries) {
   return norm.length ? engineLastLogAt(norm) : null;
 }
 
-/** The single place that says whether audio may play right now. Mirrors Gaps.isQuietHours; kept separate so the page has one named guard. */
+/** The single named guard for audio: false in quiet hours [22:00, 07:00) local. */
 export function audioAllowed(now, zone) {
   return !Gaps.isQuietHours(now, zone);
 }

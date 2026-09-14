@@ -1,35 +1,39 @@
 // The Cost Board: wall-display dashboard page.
 //
-// Static, no framework, no build. Polls Supabase (or the mock server) every 60 s, recomputes the
-// projection in the browser with engine.js, derives a render model with view-model.js and paints it.
+// Static, no framework, no build. Polls Supabase (or the mock server) every 60 s, recomputes the projection in the
+// browser with engine.js (project, sinceInstall, sinceMonday), builds the flat binding model with view-model.js and
+// writes it into the elements of index.html: textContent from `text`, data-tone from `tone`, hidden when `text` is
+// null. app.js never creates text of its own; configuration and network errors go to the console, and status.error
+// shows only data (the HTTP status code, or the platform's own fetch/JSON exception text; see errorDisplay).
 //
-// Kiosk deployment (Chrome on the TV box). Autoplay: Chrome only lets a page start audio after a user
-// gesture unless it is launched with
+// Kiosk deployment (Chrome on the TV box). Autoplay: Chrome only lets a page start audio after a user gesture
+// unless it is launched with
 //
 //     chrome --kiosk --autoplay-policy=no-user-gesture-required "http://<host>/dashboard/?tv=tv1"
 //
-// Without that flag the first voice line is held back and the page shows a 48 px "Tap once to enable
-// voice" overlay; a single click or key press dismisses it, unlocks audio, and the held line plays.
+// Without that flag a voice line rejected by the autoplay policy is held; the next click or key press silently
+// unlocks audio and plays the held line (nothing is shown on screen).
 //
-// ABSOLUTE RULE: audio never plays between 22:00 and 07:00 local (Gaps.isQuietHours). The rule is
-// enforced in decideVoice() before any request, again in playVoice() immediately before play(), and
-// the silent unlock in unlockAudio() skips its (muted) play() in quiet hours too.
+// ABSOLUTE RULE: audio never plays in [22:00, 07:00) local (Gaps.isQuietHours). The rule is enforced in
+// decideVoice() before any request, again in playVoice() immediately before play(), and the silent unlock in
+// unlockAudio() skips its muted play() in quiet hours too.
 
-import * as E from './engine.js';
 import {
+  BINDINGS,
   POLL_INTERVAL_MS,
   POLL_QUERIES,
   WEEKLY_ROTATE_MS,
   audioAllowed,
   buildModel,
   decideVoice,
-  effectiveTrackingStart,
+  deriveState,
   effectiveZone,
+  errorDisplay,
   parseFlags,
   resolveApi,
   restHeaders,
   settingsMap,
-  weeklySentence,
+  splitSentences,
 } from './view-model.js';
 
 // ---------------------------------------------------------------------------------------------
@@ -41,58 +45,45 @@ const browserZone = (() => {
   try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { return 'UTC'; }
 })();
 
-const $ = (id) => document.getElementById(id);
-const els = {
-  board: $('board'),
-  lossFigure: $('loss-figure'),
-  lossSince: $('loss-since'),
-  lossSkipped: $('loss-skipped'),
-  frenchBanked: $('french-banked'),
-  frenchRate: $('french-rate'),
-  frenchNclc7: $('french-nclc7'),
-  frenchLanding: $('french-landing'),
-  weekly: $('weekly'),
-  weeklyText: $('weekly-text'),
-  footerYear30: $('footer-year30'),
-  footerUpdated: $('footer-updated'),
-  statusDot: $('status-dot'),
-  statusError: $('status-error'),
-  configMissing: $('config-missing'),
-  configMissingText: $('config-missing-text'),
-  voiceOverlay: $('voice-overlay'),
-  audio: $('voice-audio'),
-};
+/** name -> element, from every [data-bind] in the markup. */
+const bound = new Map();
+for (const el of document.querySelectorAll('[data-bind]')) bound.set(el.dataset.bind, el);
+for (const name of BINDINGS) {
+  if (!bound.has(name)) console.error(`[costboard] index.html has no element for binding "${name}"`);
+}
+const audio = document.querySelector('audio');
+// Belt and braces for the ABSOLUTE RULE: a clip that is still sounding when 22:00 arrives is stopped at once.
+for (const ev of ['play', 'playing', 'timeupdate']) {
+  audio.addEventListener(ev, () => {
+    if (!audio.paused && !audio.muted && !audioAllowed(Date.now(), state.zone)) audio.pause();
+  });
+}
 
 const state = {
-  // last good data
   entries: [],
   snapshots: [],
   settings: {},
   weekly: null,
   latestVoiceEvent: null,
-  // render bookkeeping
-  status: { ok: true, error: null, updatedAt: null },
-  model: null,
+  derived: null, // { zone, projection, sinceInstall, sinceMonday }
+  status: { ok: true, error: null },
   zone: browserZone,
-  weeklyIndex: 0, // which sentence of the weekly summary is on screen
-  weeklyKey: null, // week_start of the summary the index belongs to
-  // voice bookkeeping
+  weeklyIndex: 0,
+  weeklyKey: null,
   voiceInFlight: false,
   voiceLastRequestAt: null,
   audioUnlocked: false,
   pendingClip: null, // { blob, fetchedAt } held back by the autoplay policy
-  pollTimer: null,
   polling: false,
 };
 
-els.board.dataset.kiosk = flags.kiosk ? '1' : '0';
+render();
 
 if (!api.ok) {
-  els.configMissingText.textContent = api.reason;
-  els.configMissing.hidden = false;
-  els.statusDot.classList.remove('status-dot--ok');
-  els.statusDot.classList.add('status-dot--error');
-  els.footerUpdated.textContent = 'not configured';
+  // The reason is our own wording, so it stays in the console; nothing is written to the screen.
+  console.error('[costboard] configuration error:', api.reason);
+  state.status = { ok: false, error: null };
+  render();
 } else {
   start();
 }
@@ -104,10 +95,9 @@ function start() {
   for (const ev of ['click', 'keydown', 'touchstart', 'pointerdown']) {
     document.addEventListener(ev, onUserGesture, { passive: true });
   }
-  setInterval(tickClock, 1000);
   setInterval(rotateWeekly, WEEKLY_ROTATE_MS);
   poll();
-  state.pollTimer = setInterval(poll, POLL_INTERVAL_MS);
+  setInterval(poll, POLL_INTERVAL_MS);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -131,181 +121,95 @@ async function poll() {
     state.settings = settingsMap(settingsRows);
     state.weekly = weeklyRows[0] || null;
     state.latestVoiceEvent = voiceRows[0] || null;
-    state.status = { ok: true, error: null, updatedAt: now };
-    recompute(now);
+    state.derived = deriveState({ entries, snapshots, settings: state.settings, flags, now, browserZone });
+    state.zone = state.derived.zone;
+    state.status = { ok: true, error: null };
+    const weeklyKey = state.weekly ? state.weekly.week_start || state.weekly.id || null : null;
+    if (weeklyKey !== state.weeklyKey) {
+      state.weeklyKey = weeklyKey;
+      state.weeklyIndex = 0;
+    }
     render();
     await maybeSpeak(now);
   } catch (err) {
-    state.status = { ok: false, error: describeError(err), updatedAt: state.status.updatedAt };
-    if (state.model) {
-      // Keep the last good numbers on screen; only the footer changes.
-      state.model = buildModel({
-        projection: state.projection,
-        deltas: state.deltas,
-        weekly: state.weekly,
-        status: state.status,
-        flags,
-        now,
-      });
-      render();
-    } else {
-      renderFooterOnly();
-    }
-    console.warn('[costboard] poll failed:', err);
+    // Keep the last good numbers on screen; only status.error changes.
+    console.error('[costboard] poll failed:', err);
+    state.status = { ok: false, error: errorDisplay(err) };
+    state.zone = effectiveZone(flags, state.settings, browserZone);
+    render();
   } finally {
     state.polling = false;
   }
 }
 
+/**
+ * One REST GET. Errors carry `display` (see errorDisplay): the platform's own exception text for fetch/JSON
+ * failures, the numeric HTTP status for a failed response, nothing for a wrong shape. `message` is console only.
+ */
 async function getRows(query) {
-  const res = await fetch(`${api.base}/rest/v1/${query}`, { headers: restHeaders(api.key), cache: 'no-store' });
-  if (!res.ok) throw new Error(`${query.split('?')[0]}: HTTP ${res.status}`);
-  const body = await res.json();
-  if (!Array.isArray(body)) throw new Error(`${query.split('?')[0]}: unexpected response shape`);
+  const table = query.split('?')[0];
+  let res;
+  let body;
+  try {
+    res = await fetch(`${api.base}/rest/v1/${query}`, { headers: restHeaders(api.key), cache: 'no-store' });
+  } catch (err) {
+    throw platformError(err);
+  }
+  if (!res.ok) {
+    const e = new Error(`${table}: HTTP ${res.status}`);
+    e.display = String(res.status);
+    throw e;
+  }
+  try {
+    body = await res.json();
+  } catch (err) {
+    throw platformError(err);
+  }
+  if (!Array.isArray(body)) throw new Error(`${table}: unexpected response shape`);
   return body;
 }
 
-function describeError(err) {
-  if (!err) return 'unknown error';
-  if (err instanceof TypeError) return `network error: ${err.message}`;
-  return err.message || String(err);
+function platformError(err) {
+  const e = err instanceof Error ? err : new Error(String(err));
+  if (e.name && e.message) e.display = `${e.name}: ${e.message}`;
+  return e;
 }
 
-function recompute(now) {
-  state.zone = effectiveZone(flags, state.settings, browserZone);
-  const trackingStart = effectiveTrackingStart(state.settings);
-  state.projection = E.project(state.entries, now, state.zone, trackingStart);
-  const baseline = E.lastMonday(state.snapshots, state.projection.today, state.zone);
-  state.deltas = E.compare(state.projection, baseline);
-  state.model = buildModel({
-    projection: state.projection,
-    deltas: state.deltas,
+// ---------------------------------------------------------------------------------------------
+// Rendering: the model onto the bindings
+// ---------------------------------------------------------------------------------------------
+function render() {
+  const d = state.derived;
+  const model = buildModel({
+    projection: d ? d.projection : null,
+    sinceInstall: d ? d.sinceInstall : null,
+    sinceMonday: d ? d.sinceMonday : null,
     weekly: state.weekly,
+    weeklyIndex: state.weeklyIndex,
     status: state.status,
     flags,
-    now,
   });
-}
-
-// ---------------------------------------------------------------------------------------------
-// Rendering
-// ---------------------------------------------------------------------------------------------
-const TONES = ['tone-red', 'tone-green', 'tone-muted', 'tone-neutral'];
-function setTone(el, tone) {
-  for (const t of TONES) el.classList.remove(t);
-  el.classList.add(`tone-${tone}`);
-}
-
-function setText(el, text) {
-  if (el.textContent !== text) el.textContent = text;
-}
-
-function renderDelta(container, arrowEl, textEl, delta) {
-  setText(arrowEl, delta.arrow);
-  setText(textEl, delta.text);
-  setTone(container, delta.tone);
-  container.setAttribute('aria-label', delta.label);
-}
-
-function render() {
-  const m = state.model;
-  if (!m) return;
-
-  // 1. Cumulative loss
-  setText(els.lossFigure, m.loss.figure);
-  setTone(els.lossFigure, m.loss.tone);
-  setText(els.lossSince, m.loss.since);
-  setText(els.lossSkipped, m.loss.skipped);
-
-  // 2. Goal dates
-  for (const g of m.goals) {
-    const li = $(`goal-${g.key}`);
-    if (!li) continue;
-    const date = li.querySelector('.goal__date');
-    setText(date, g.date);
-    setTone(date, g.dateTone);
-    renderDelta(
-      li.querySelector('.goal__delta'),
-      li.querySelector('.goal__arrow'),
-      li.querySelector('.goal__delta-text'),
-      g.delta,
-    );
+  for (const [name, el] of bound) {
+    const v = model[name];
+    if (!v || v.text == null) {
+      if (el.textContent !== '') el.textContent = '';
+      el.hidden = true;
+      el.removeAttribute('data-tone');
+      continue;
+    }
+    if (el.textContent !== v.text) el.textContent = v.text;
+    el.hidden = false;
+    if (v.tone) el.setAttribute('data-tone', v.tone);
+    else el.removeAttribute('data-tone');
   }
-  const partner = $('goal-partner_tuition');
-  setText(partner.querySelector('.goal__date'), m.partner.date);
-
-  // 3. French progress
-  setText(els.frenchBanked, m.french.banked);
-  setText(els.frenchRate, m.french.rate);
-  for (const [el, item] of [[els.frenchNclc7, m.french.nclc7], [els.frenchLanding, m.french.landing]]) {
-    const date = el.querySelector('.french__date');
-    setText(date, item.date);
-    setTone(date, item.dateTone);
-    renderDelta(
-      el.querySelector('.french__delta'),
-      el.querySelector('.french__arrow'),
-      el.querySelector('.french__delta-text'),
-      item.delta,
-    );
-  }
-
-  // 4. Weekly summary: one sentence at a time (a whole four-sentence summary does not fit at 48 px).
-  const weeklyKey = state.weekly ? state.weekly.week_start || state.weekly.id || null : null;
-  if (weeklyKey !== state.weeklyKey) {
-    state.weeklyKey = weeklyKey;
-    state.weeklyIndex = 0;
-  }
-  renderWeekly();
-
-  // 5. Footer
-  setText(els.footerYear30, m.footer.year30);
-  renderFooterOnly();
-}
-
-function renderWeekly() {
-  const m = state.model;
-  if (!m) return;
-  els.weekly.hidden = !m.weekly.show;
-  setText(els.weeklyText, weeklySentence(m.weekly.sentences, state.weeklyIndex));
 }
 
 function rotateWeekly() {
-  const m = state.model;
-  if (!m || !m.weekly.show || m.weekly.sentences.length < 2) return;
-  state.weeklyIndex = (state.weeklyIndex + 1) % m.weekly.sentences.length;
-  renderWeekly();
-}
-
-function renderFooterOnly() {
-  const m = state.model;
-  const ok = state.status.ok;
-  // Grey only: red and green are reserved for dates that slipped or moved closer.
-  els.statusDot.classList.toggle('status-dot--error', !ok);
-  els.statusDot.setAttribute('aria-label', ok ? 'connection ok' : 'last poll failed');
-  if (m) {
-    setText(els.footerUpdated, m.footer.updated);
-    els.statusError.hidden = !m.footer.showError;
-    setText(els.statusError, m.footer.error);
-  } else {
-    setText(els.footerUpdated, state.status.updatedAt == null ? 'waiting for first update' : '');
-    els.statusError.hidden = flags.kiosk || ok || !state.status.error;
-    setText(els.statusError, state.status.error || '');
-  }
-}
-
-function tickClock() {
-  if (!state.model) return;
-  // The "updated hh:mm" text is derived from the last successful poll; re-deriving it every second
-  // keeps it correct across zone changes and makes the footer a live element.
-  state.model.footer.updated = buildModel({
-    projection: state.projection,
-    deltas: state.deltas,
-    weekly: state.weekly,
-    status: state.status,
-    flags,
-    now: Date.now(),
-  }).footer.updated;
-  renderFooterOnly();
+  if (!state.weekly || flags.kiosk) return;
+  const n = splitSentences(state.weekly.summary).length;
+  if (n < 2) return;
+  state.weeklyIndex = (state.weeklyIndex + 1) % n;
+  render();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -337,12 +241,12 @@ async function maybeSpeak(now) {
     const body = await res.json();
     if (!body || typeof body.audio_base64 !== 'string' || !body.audio_base64) return;
     const blob = base64ToBlob(body.audio_base64, body.mime || 'audio/mpeg');
-    // The function inserted a voice_events row; mirror it locally so the next poll cannot double-fire
-    // before the row is visible.
+    // The function inserted a voice_events row; mirror it locally so the next poll cannot double-fire before the
+    // row is visible.
     state.latestVoiceEvent = { fired_at: body.fired_at || new Date(now).toISOString(), line: body.line || '', played_by: flags.tv };
     await playVoice(blob);
   } catch (err) {
-    console.warn('[costboard] voice-line failed:', err);
+    console.error('[costboard] voice-line failed:', err);
   } finally {
     state.voiceInFlight = false;
   }
@@ -366,23 +270,20 @@ async function playVoice(blob) {
   }
   if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
   currentObjectUrl = URL.createObjectURL(blob);
-  els.audio.src = currentObjectUrl;
+  audio.src = currentObjectUrl;
   try {
-    await els.audio.play();
+    await audio.play();
     state.audioUnlocked = true;
     state.pendingClip = null;
-    els.voiceOverlay.hidden = true;
   } catch (err) {
-    // Autoplay policy (NotAllowedError): hold the clip and ask for one gesture.
-    console.warn('[costboard] play() rejected, waiting for a user gesture:', err && err.name);
+    // Autoplay policy (NotAllowedError): hold the clip until the next click or key press. Nothing is shown.
+    console.warn('[costboard] play() rejected, holding the clip for a user gesture:', err && err.name);
     state.audioUnlocked = false;
     state.pendingClip = { blob, fetchedAt: Date.now() };
-    els.voiceOverlay.hidden = false;
   }
 }
 
 async function onUserGesture() {
-  if (!els.voiceOverlay.hidden) els.voiceOverlay.hidden = true;
   if (state.audioUnlocked) return;
   await unlockAudio();
   const clip = state.pendingClip;
@@ -394,10 +295,9 @@ async function onUserGesture() {
 }
 
 /**
- * Pre-unlock audio inside a user gesture. Chrome grants media playback to a page once it has received
- * a user activation; the silent, muted play() below is what surfaces the grant to the <audio> element.
- * In quiet hours even that muted play() is skipped: the activation itself is remembered by the
- * browser, so the morning's first real line still plays without another tap.
+ * Pre-unlock audio inside a user gesture. Chrome grants media playback to a page once it has received a user
+ * activation; the silent, muted play() below surfaces the grant to the <audio> element. In quiet hours even that
+ * muted play() is skipped: the activation itself is remembered, so the morning's first line still plays.
  */
 async function unlockAudio() {
   state.audioUnlocked = true;
@@ -414,15 +314,17 @@ async function unlockAudio() {
       if (ctx.state === 'suspended') await ctx.resume();
       setTimeout(() => ctx.close().catch(() => {}), 500);
     }
-    // Also unlock the <audio> element itself with a silent, muted WAV (no audible output).
-    els.audio.src = silentWavDataUri();
-    els.audio.muted = true;
-    await els.audio.play();
-    els.audio.pause();
-    els.audio.muted = false;
-    els.audio.currentTime = 0;
+    // Also unlock the <audio> element itself with a silent, muted WAV (no audible output). The guard is re-checked
+    // here because the awaits above could straddle 22:00.
+    if (!audioAllowed(Date.now(), state.zone)) return;
+    audio.src = silentWavDataUri();
+    audio.muted = true;
+    await audio.play();
+    audio.pause();
+    audio.muted = false;
+    audio.currentTime = 0;
   } catch (err) {
-    els.audio.muted = false;
+    audio.muted = false;
     console.warn('[costboard] audio unlock failed:', err && err.name);
   }
 }

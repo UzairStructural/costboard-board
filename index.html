@@ -3,102 +3,268 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
-  <title>The Cost Board</title>
-  <link rel="stylesheet" href="./styles.css">
+  <style id="theme">
+    /* Theme. Every colour, size, spacing, font family, weight, line-height and layout fraction is a token in
+       :root; every rule after :root uses var(--token) values and CSS keywords only. Replace this block wholesale.
+       1080p reference in brackets. */
+    :root {
+      --color-scheme: dark;
+      --color-background: #0b0b0f;
+      --color-text: #f2f2f5;
+      --color-label: #a3a3ad;
+      --color-slipped: #ff3b3b;
+      --color-never: #ff3b3b;
+      --color-closer: #2fd66f;
+      --color-unchanged: #a3a3ad;
+      --color-error: #7a7a86;
+
+      --font-family: "Inter", "Segoe UI", "Helvetica Neue", Arial, system-ui, sans-serif;
+      --font-numeric: tabular-nums;
+      --font-weight-cost: 800;
+      --font-weight-key: 700;
+      --font-weight-body: 500;
+      --font-weight-label: 500;
+
+      --size-cost: min(12vh, 13vw);          /* 129.6 px, the largest element */
+      --size-key: min(11.12vh, 12vw);        /* 120.1 px, the five projected goal dates */
+      --size-body: min(4.45vh, 5vw);         /* 48.1 px, everything else */
+
+      --line-height-cost: 1;
+      --line-height-key: 1;
+      --line-height-body: 1.05;
+      --weekly-lines: 2;
+      --weekly-height: calc(var(--size-body) * var(--line-height-body) * var(--weekly-lines));
+
+      --space-0: 0;
+      --board-pad-x: 1.5vw;
+      --board-pad-y: 1vh;
+      --gap-inline: 1vw;
+      --gap-row: 0;
+      --layout-full: 100%;
+      --layout-viewport-width: 100vw;
+      --layout-viewport-height: 100vh;
+      --layout-cost-rule-fraction: 1 1 0;
+      --layout-grow: 1 1 auto;
+      --layout-fixed: 0 0 auto;
+      --layout-min-width: 0;
+      --layout-goal-columns: minmax(0, 4.3fr) minmax(0, 7.5fr) minmax(0, 2.85fr) minmax(0, 1.6fr) minmax(0, 1.6fr);
+    }
+
+    html,
+    body {
+      margin: var(--space-0);
+      padding: var(--space-0);
+      width: var(--layout-viewport-width);
+      height: var(--layout-viewport-height);
+      overflow: hidden;
+      color-scheme: var(--color-scheme);
+      background: var(--color-background);
+      color: var(--color-text);
+      font-family: var(--font-family);
+      font-size: var(--size-body);
+      font-weight: var(--font-weight-body);
+      line-height: var(--line-height-body);
+      font-variant-numeric: var(--font-numeric);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: var(--space-0);
+      padding: var(--space-0);
+    }
+
+    .board {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      width: var(--layout-full);
+      height: var(--layout-full);
+      padding: var(--board-pad-y) var(--board-pad-x);
+    }
+
+    .row {
+      display: flex;
+      align-items: baseline;
+      column-gap: var(--gap-inline);
+      min-width: var(--layout-min-width);
+      white-space: nowrap;
+    }
+
+    .cost {
+      display: flex;
+      align-items: end;
+      column-gap: var(--gap-inline);
+    }
+
+    .cost__value {
+      flex: var(--layout-fixed);
+      font-size: var(--size-cost);
+      font-weight: var(--font-weight-cost);
+      line-height: var(--line-height-cost);
+    }
+
+    .cost__rule {
+      flex: var(--layout-cost-rule-fraction);
+      min-width: var(--layout-min-width);
+      color: var(--color-label);
+    }
+
+    .goals {
+      display: flex;
+      flex-direction: column;
+      row-gap: var(--gap-row);
+    }
+
+    .goal {
+      display: grid;
+      grid-template-columns: var(--layout-goal-columns);
+      column-gap: var(--gap-inline);
+      align-items: baseline;
+    }
+
+    .goal > * {
+      min-width: var(--layout-min-width);
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+
+    .goal__projected {
+      font-size: var(--size-key);
+      font-weight: var(--font-weight-key);
+      line-height: var(--line-height-key);
+    }
+
+    .label {
+      color: var(--color-label);
+      font-weight: var(--font-weight-label);
+    }
+
+    .weekly {
+      height: var(--weekly-height);
+      overflow: hidden;
+    }
+
+    .weekly__text {
+      display: -webkit-box;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: var(--weekly-lines);
+      overflow: hidden;
+    }
+
+    .weekly__text[hidden] {
+      display: none;
+    }
+
+    .weekly:has(> [hidden]) {
+      height: var(--space-0);
+    }
+
+    .footer__error {
+      flex: var(--layout-grow);
+      min-width: var(--layout-min-width);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: var(--color-error);
+    }
+
+    [data-tone="slipped"] {
+      color: var(--color-slipped);
+    }
+
+    [data-tone="never"] {
+      color: var(--color-never);
+    }
+
+    [data-tone="closer"] {
+      color: var(--color-closer);
+    }
+
+    [data-tone="unchanged"] {
+      color: var(--color-unchanged);
+    }
+
+    [hidden] {
+      display: none;
+    }
+  </style>
 </head>
 <body>
-  <main id="board" class="board" data-kiosk="0">
-
-    <!-- 1. Cumulative loss: the headline, red while any target hour is unpaid. -->
-    <section id="loss" class="loss" aria-live="polite" aria-atomic="true">
-      <p id="loss-figure" class="loss__figure num tone-red">$0</p>
-      <p id="loss-captions" class="loss__captions">
-        <span id="loss-skipped" class="loss__skipped num">0 French hours skipped</span>
-        <span id="loss-since" class="loss__since num">since —</span>
-      </p>
+  <main class="board">
+    <section class="cost">
+      <span class="cost__value" data-bind="cost.cumulative"></span>
+      <span class="cost__rule" data-bind="cost.accrualRule"></span>
     </section>
 
-    <!-- 2. The four goal dates versus Monday's snapshot, plus the partner's fixed tuition schedule. -->
-    <section id="goals" class="goals" aria-label="Goal dates versus Monday">
-      <ul id="goal-list" class="goal-list">
-        <li id="goal-brother" class="goal" data-key="brother">
-          <span class="goal__label">Brother's tuition</span>
-          <span class="goal__date num tone-neutral">—</span>
-          <span class="goal__delta num tone-muted"><span class="goal__arrow" aria-hidden="true"></span><span class="goal__delta-text"></span></span>
-        </li>
-        <li id="goal-india_house" class="goal" data-key="india_house">
-          <span class="goal__label">House in India</span>
-          <span class="goal__date num tone-neutral">—</span>
-          <span class="goal__delta num tone-muted"><span class="goal__arrow" aria-hidden="true"></span><span class="goal__delta-text"></span></span>
-        </li>
-        <li id="goal-marriage" class="goal" data-key="marriage">
-          <span class="goal__label">Marriage</span>
-          <span class="goal__date num tone-neutral">—</span>
-          <span class="goal__delta num tone-muted"><span class="goal__arrow" aria-hidden="true"></span><span class="goal__delta-text"></span></span>
-        </li>
-        <li id="goal-us_house" class="goal" data-key="us_house">
-          <span class="goal__label">House in US</span>
-          <span class="goal__date num tone-neutral">—</span>
-          <span class="goal__delta num tone-muted"><span class="goal__arrow" aria-hidden="true"></span><span class="goal__delta-text"></span></span>
-        </li>
-        <li id="goal-partner_tuition" class="goal goal--partner" data-key="partner_tuition">
-          <span class="goal__label">Partner's tuition</span>
-          <span class="goal__date num tone-muted">—</span>
-          <span class="goal__delta tone-muted">fixed schedule</span>
-        </li>
-      </ul>
-    </section>
-
-    <!-- 3. French progress: hours banked, trailing rate, exam and landing dates versus Monday. -->
-    <section id="french" class="french" aria-label="French progress">
-      <div class="french__row">
-        <span id="french-banked" class="french__banked num">0 of 1,000 h</span>
-        <span id="french-rate" class="french__rate num">0.0 h/day (7-day)</span>
+    <section class="goals">
+      <div class="goal">
+        <span class="label" data-bind="label.brother"></span>
+        <span class="goal__projected" data-bind="goal.brother.projected"></span>
+        <span data-bind="goal.brother.plan"></span>
+        <span data-bind="goal.brother.driftPlan"></span>
+        <span data-bind="goal.brother.driftMonday"></span>
       </div>
-      <div class="french__row">
-        <span id="french-nclc7" class="french__item">
-          <span class="french__label">NCLC 7</span>
-          <span class="french__date num tone-neutral">—</span>
-          <span class="french__delta num tone-muted"><span class="french__arrow" aria-hidden="true"></span><span class="french__delta-text"></span></span>
-        </span>
-        <span id="french-landing" class="french__item">
-          <span class="french__label">Canada landing</span>
-          <span class="french__date num tone-neutral">—</span>
-          <span class="french__delta num tone-muted"><span class="french__arrow" aria-hidden="true"></span><span class="french__delta-text"></span></span>
-        </span>
+      <div class="goal">
+        <span class="label" data-bind="label.india_house"></span>
+        <span class="goal__projected" data-bind="goal.india_house.projected"></span>
+        <span data-bind="goal.india_house.plan"></span>
+        <span data-bind="goal.india_house.driftPlan"></span>
+        <span data-bind="goal.india_house.driftMonday"></span>
+      </div>
+      <div class="goal">
+        <span class="label" data-bind="label.marriage"></span>
+        <span class="goal__projected" data-bind="goal.marriage.projected"></span>
+        <span data-bind="goal.marriage.plan"></span>
+        <span data-bind="goal.marriage.driftPlan"></span>
+        <span data-bind="goal.marriage.driftMonday"></span>
+      </div>
+      <div class="goal">
+        <span class="label" data-bind="label.us_house"></span>
+        <span class="goal__projected" data-bind="goal.us_house.projected"></span>
+        <span data-bind="goal.us_house.plan"></span>
+        <span data-bind="goal.us_house.driftPlan"></span>
+        <span data-bind="goal.us_house.driftMonday"></span>
+      </div>
+      <div class="goal">
+        <span class="label" data-bind="label.partner"></span>
+        <span class="goal__projected" data-bind="goal.partner.projected"></span>
+        <span data-bind="goal.partner.plan"></span>
+        <span data-bind="goal.partner.driftPlan"></span>
+        <span data-bind="goal.partner.driftMonday"></span>
       </div>
     </section>
 
-    <!-- 4. Weekly summary: one sentence at a time (app.js rotates through the four). -->
-    <section id="weekly" class="weekly" aria-label="Weekly summary" hidden>
-      <p id="weekly-text" class="weekly__text"></p>
+    <section class="row">
+      <span data-bind="drift.sinceInstall"></span>
     </section>
 
-    <!-- 5. Footer: the year-30 figure (small by spec) and the connection status, grey only. -->
-    <footer id="footer" class="footer">
-      <span id="footer-year30" class="footer__year30 num">Year-30 north star: $0</span>
-      <span id="footer-status" class="footer__status">
-        <span id="status-error" class="footer__error" hidden></span>
-        <span id="status-dot" class="status-dot" role="img" aria-label="connection ok"></span>
-        <span id="footer-updated" class="footer__updated num">waiting for first update</span>
-      </span>
+    <section>
+      <div class="row">
+        <span data-bind="french.banked"></span>
+        <span class="label" data-bind="label.frenchTotal"></span>
+        <span class="label" data-bind="label.nclc7"></span>
+        <span data-bind="french.nclc7"></span>
+      </div>
+      <div class="row">
+        <span class="label" data-bind="label.landing"></span>
+        <span data-bind="french.landing"></span>
+        <span class="label" data-bind="french.basis"></span>
+      </div>
+    </section>
+
+    <section class="weekly">
+      <p class="weekly__text" data-bind="weekly.summary"></p>
+    </section>
+
+    <footer class="row">
+      <span class="label" data-bind="label.year30"></span>
+      <span data-bind="footer.year30"></span>
+      <span class="footer__error" data-bind="status.error"></span>
     </footer>
   </main>
 
-  <!-- Shown only when config.js is missing or blank (never in mock mode). -->
-  <div id="config-missing" class="overlay overlay--config" role="alert" hidden>
-    <p id="config-missing-text" class="overlay__text"></p>
-  </div>
+  <audio preload="auto"></audio>
 
-  <!-- Shown only when the browser's autoplay policy rejected play(); any click or key dismisses it. -->
-  <div id="voice-overlay" class="overlay overlay--voice" hidden>
-    <p class="overlay__text">Tap once to enable voice</p>
-  </div>
-
-  <audio id="voice-audio" preload="auto"></audio>
-
-  <!-- config.js is git-ignored; the mock server serves it virtually. When it is absent the page shows #config-missing. -->
   <script src="https://zraumtpmrmzegusjeeyw.supabase.co/functions/v1/dashboard/config.js"></script>
   <script type="module" src="./app.js"></script>
 </body>

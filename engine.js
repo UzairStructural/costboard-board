@@ -1,51 +1,61 @@
 // The Cost Board projection engine, JavaScript port.
 //
-// This is a line-for-line port of costboard/engine (Kotlin), which is the reference implementation.
-// It runs in the dashboard page (browser) and in the Supabase edge functions (Deno). Parity with the
-// Kotlin engine is enforced by dashboard/engine.test.mjs against shared/golden.json, which the Kotlin
-// test suite generates. If you change a number here, change it in Constants.kt too, then regenerate.
+// A line-for-line port of costboard/engine (Kotlin), the reference implementation. It runs in the TV page (browser)
+// and in the Supabase edge functions (Deno). Parity is enforced by dashboard/engine.test.mjs against
+// shared/golden.json, which the Kotlin test suite generates. Change a number here only together with Constants.kt,
+// then regenerate. The projection returns numbers and dates; presentation helpers at the bottom are separate.
 //
-// Dates: LocalDate values are ISO strings "YYYY-MM-DD". Instants are epoch milliseconds (or anything
-// Date.parse accepts, e.g. the "+00:00" timestamps PostgREST returns). Zones are IANA names.
+// Dates: LocalDate values are ISO strings "YYYY-MM-DD". Instants are epoch milliseconds (or anything Date.parse
+// accepts, e.g. the "+00:00" timestamps PostgREST returns). Zones are IANA names.
 
 export const Constants = Object.freeze({
+  MODEL_VERSION: '2026-09-14',
+
   TOTAL_FRENCH_HOURS_NEEDED: 1000.0,
   DAILY_FRENCH_TARGET: 3.0,
   POST_EXAM_LAG_DAYS: 120,
   TRAILING_WINDOW_DAYS: 7,
+  DOORDASH_PACE_WINDOW_DAYS: 28,
+  DOORDASH_SEED_HOURS_PER_WEEK_PHASE1: 45.0,
+  DOORDASH_SEED_HOURS_PER_WEEK_PHASE2: 80.0,
 
   JOB_SAVINGS_INITIAL: 3000.0,
   JOB_SAVINGS_RAISED: 4000.0,
   JOB_SAVINGS_RAISE_MONTH: 6,
   DOORDASH_RATE_US: 18.0,
 
-  DOORDASH_RATE_CA: 12.41, // CAD 20/hr gross, -15% vehicle, x 0.73 FX (user estimate, unverified)
+  DOORDASH_RATE_CA: 12.41, // CAD 20/hr gross, -15% vehicle, x 0.73 FX (owner's estimate, unverified)
   BUSINESS_TAKE_HOME: 0.55,
   LIVING_COSTS_CA: 2200.0,
-  DOORDASH_STOP_RUN_RATE: 100000.0,
+  DOORDASH_STOP_RUN_RATE: 100000.0, // a TARGET rule; not applied to the projected pace (see Constants.kt)
+  DOORDASH_STOP_IN_PROJECTION: false,
 
   RUN_RATE_M0: 30000.0,
   RUN_RATE_M12: 85000.0,
   RUN_RATE_M24: 175000.0,
   RUN_RATE_M36: 300000.0,
   RUN_RATE_M48: 500000.0,
-  DAYS_PER_MONTH: 30.4375,
 
   PARTNER_TUITION_DEBIT: 10000.0,
   PARTNER_TUITION_TOTAL: 50000.0,
   PARTNER_TUITION_INTERVAL_MONTHS: 6,
   INDIA_HOUSE_EMI: 567.0,
   INDIA_HOUSE_EMI_MONTHS: 240,
+  INDIA_HOUSE_EMI_IN_PROJECTION: true,
   SIMULATION_HORIZON_MONTHS: 600,
+  PLAN_KEY_PARTNER: 'partner',
 
   // Skipping a French hour at 3 hr/day pushes the landing date later, shifting a 30-year business
   // curve right. NPV of that profit stream at 8 % is ~$14.6M; annual carrying cost / 365 / 3 ~= $1,600/hr.
+  // Accrual: at 23:59 local each day, max(0, 3.0 - hoursLoggedThatDay) x 1601 is added; never repaid.
   COST_PER_SKIPPED_FRENCH_HOUR: 1601.0, // primary, displayed
   YEAR_30_NET_WORTH_PER_HOUR: 42721.0, // north star, small text only
+  ACCRUAL_RULE_TEXT: 'accrues $1,601 per hour under target · closes at 23:59',
 
   WAKING_START_HOUR: 7,
   WAKING_END_HOUR: 22,
   PROMPT_INTERVAL_MINUTES: 90,
+  PROMPT_ACTION_HOURS: 1.0,
   ESCALATION_GAP_MINUTES: 180,
 });
 
@@ -59,6 +69,16 @@ export const GOALS = Object.freeze([
 export const KEY_PARTNER = 'partner_tuition';
 export const KEY_NCLC7 = 'nclc7';
 export const KEY_LANDING = 'landing';
+export const KEY_MODEL = 'model';
+
+/** The owner's immovable plan, verbatim. "partner" is the partner's tuition final payment. */
+export const PLAN_DATES = Object.freeze({
+  brother: '2027-03-14',
+  india_house: '2027-12-14',
+  marriage: '2029-08-14',
+  us_house: '2030-07-14',
+  partner: '2029-03-14',
+});
 
 const MAX_PROJECTION_DAYS = 3650000;
 const DAY_MS = 86400000;
@@ -104,6 +124,16 @@ export const LDate = {
   /** ChronoUnit.DAYS.between(a, b): b - a in whole days. */
   daysBetween(a, b) {
     return LDate.toEpochDay(b) - LDate.toEpochDay(a);
+  },
+  /** ChronoUnit.MONTHS.between(a, b): whole months, truncated toward zero, like java.time. */
+  monthsBetween(a, b) {
+    const A = LDate.parse(a);
+    const B = LDate.parse(b);
+    let total = (B.y * 12 + B.m) - (A.y * 12 + A.m);
+    const days = B.d - A.d;
+    if (total > 0 && days < 0) total--;
+    else if (total < 0 && days > 0) total++;
+    return total;
   },
   isBefore(a, b) {
     return LDate.toEpochDay(a) < LDate.toEpochDay(b);
@@ -177,19 +207,52 @@ export function zonedToMs(iso, h, mi, zone) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Rates
+// Rates and paces
 // ---------------------------------------------------------------------------------------------
 function normEntry(e) {
   return { loggedAt: toMs(e.loggedAt ?? e.logged_at), activity: e.activity, hours: Number(e.hours), note: e.note ?? null, id: e.id ?? null };
 }
 
-export function trailingDailyRate(entries, activity, nowMs, windowDays = Constants.TRAILING_WINDOW_DAYS) {
+export function hoursInWindow(entries, activity, nowMs, windowDays) {
   const from = nowMs - windowDays * DAY_MS;
   let hours = 0;
-  for (const e of entries) {
-    if (e.activity === activity && e.loggedAt > from) hours += e.hours;
-  }
-  return hours / windowDays;
+  for (const e of entries) if (e.activity === activity && e.loggedAt > from) hours += e.hours;
+  return hours;
+}
+
+export function trailingDailyRate(entries, activity, nowMs, windowDays = Constants.TRAILING_WINDOW_DAYS) {
+  return hoursInWindow(entries, activity, nowMs, windowDays) / windowDays;
+}
+
+/** Complete days of data since the tracking start (today excluded), capped at the window. */
+export function dataDays(trackingStartIso, todayIso, windowDays) {
+  if (trackingStartIso == null) return 0;
+  return Math.min(windowDays, Math.max(0, LDate.daysBetween(trackingStartIso, todayIso)));
+}
+
+/** Actual hours in the window plus the seed for every day of the window that has no data yet. */
+export function pace(entries, activity, nowMs, trackingStartIso, todayIso, windowDays, seedHoursPerDay) {
+  const d = dataDays(trackingStartIso, todayIso, windowDays);
+  const actual = hoursInWindow(entries, activity, nowMs, windowDays);
+  const hoursPerDay = (actual + (windowDays - d) * seedHoursPerDay) / windowDays;
+  return {
+    hoursPerDay,
+    actualHoursInWindow: actual,
+    dataDays: d,
+    windowDays,
+    seedHoursPerDay,
+    isPureSeed: d === 0,
+    isPureActual: d >= windowDays,
+    actualHoursPerDay: d === 0 ? 0 : actual / d,
+  };
+}
+
+export function frenchPace(entries, nowMs, trackingStartIso, todayIso) {
+  return pace(entries, 'FRENCH', nowMs, trackingStartIso, todayIso, Constants.TRAILING_WINDOW_DAYS, Constants.DAILY_FRENCH_TARGET);
+}
+
+export function doordashPace(entries, nowMs, trackingStartIso, todayIso, seedHoursPerWeek) {
+  return pace(entries, 'DOORDASH', nowMs, trackingStartIso, todayIso, Constants.DOORDASH_PACE_WINDOW_DAYS, seedHoursPerWeek / 7.0);
 }
 
 export function totalHours(entries, activity) {
@@ -202,6 +265,16 @@ export function hoursOn(entries, activity, iso, zone) {
   let t = 0;
   for (const e of entries) if (e.activity === activity && localDate(e.loggedAt, zone) === iso) t += e.hours;
   return t;
+}
+
+export function hoursByLocalDate(entries, activity, zone) {
+  const out = new Map();
+  for (const e of entries) {
+    if (e.activity !== activity) continue;
+    const d = localDate(e.loggedAt, zone);
+    out.set(d, (out.get(d) || 0) + e.hours);
+  }
+  return out;
 }
 
 export function firstLogDate(entries, zone) {
@@ -235,8 +308,13 @@ export function projectedLanding(nclc7Iso) {
   return nclc7Iso == null ? null : LDate.plusDays(nclc7Iso, Constants.POST_EXAM_LAG_DAYS);
 }
 
+/** "at 3.0 h/day" on a pure seed, "at your pace (2.1 h/day)" once real data is blended in. */
+export function frenchBasisLabel(p) {
+  return p.isPureSeed ? `at ${Constants.DAILY_FRENCH_TARGET.toFixed(1)} h/day` : `at your pace (${p.hoursPerDay.toFixed(1)} h/day)`;
+}
+
 // ---------------------------------------------------------------------------------------------
-// Cash flow
+// Cash flow: install-anchored, month by month, income credited at month end
 // ---------------------------------------------------------------------------------------------
 const lerp = (a, b, t) => a + (b - a) * t;
 
@@ -254,12 +332,23 @@ export function jobSavings(monthIndex) {
   return monthIndex < Constants.JOB_SAVINGS_RAISE_MONTH ? Constants.JOB_SAVINGS_INITIAL : Constants.JOB_SAVINGS_RAISED;
 }
 
-/** See CashFlow.simulate in the Kotlin engine for the full description of the month step. */
-export function simulate(todayIso, landingIso, doordashHoursPerDay, startingPool = 0, horizonMonths = Constants.SIMULATION_HORIZON_MONTHS) {
+/**
+ * See CashFlow.simulate in the Kotlin engine. Options object:
+ * { doordashPhase2HoursPerDay, today, actualDoordashHoursByDate (Map iso -> hours), startingPool, horizonMonths,
+ *   emiEnabled, doordashStopsAtRunRate }.
+ */
+export function simulate(startIso, landingIso, doordashPhase1HoursPerDay, opts = {}) {
   const C = Constants;
+  const p2 = opts.doordashPhase2HoursPerDay ?? doordashPhase1HoursPerDay;
+  const todayIso = opts.today ?? startIso;
+  const actual = opts.actualDoordashHoursByDate ?? new Map();
+  const horizonMonths = opts.horizonMonths ?? C.SIMULATION_HORIZON_MONTHS;
+  const emiEnabled = opts.emiEnabled ?? C.INDIA_HOUSE_EMI_IN_PROJECTION;
+  const stops = opts.doordashStopsAtRunRate ?? C.DOORDASH_STOP_IN_PROJECTION;
+
   const fundedOn = GOALS.map(() => null);
   let nextGoal = 0;
-  let pool = startingPool;
+  let pool = opts.startingPool ?? 0;
   let partnerPaid = 0;
   const debits = [];
   let emiFrom = null;
@@ -267,66 +356,61 @@ export function simulate(todayIso, landingIso, doordashHoursPerDay, startingPool
   const ledger = [];
 
   for (let i = 1; i <= horizonMonths; i++) {
-    const start = LDate.plusMonths(todayIso, i - 1);
-    const end = LDate.plusMonths(todayIso, i);
-    const days = LDate.daysBetween(start, end);
+    const mStart = LDate.plusMonths(startIso, i - 1);
+    const mEnd = LDate.plusMonths(startIso, i);
+    const days = LDate.daysBetween(mStart, mEnd);
 
     let partner = 0;
     if (i > 1 && (i - 1) % C.PARTNER_TUITION_INTERVAL_MONTHS === 0 && partnerPaid < C.PARTNER_TUITION_TOTAL) {
       partner = Math.min(C.PARTNER_TUITION_DEBIT, C.PARTNER_TUITION_TOTAL - partnerPaid);
       partnerPaid += partner;
       pool -= partner;
-      debits.push(start);
+      debits.push(mStart);
     }
     const poolStart = pool;
 
-    let f1;
-    if (landingIso == null || !LDate.isBefore(landingIso, end)) f1 = 1.0;
-    else if (!LDate.isAfter(landingIso, start)) f1 = 0.0;
-    else f1 = LDate.daysBetween(start, landingIso) / days;
-    const f2 = 1.0 - f1;
+    const pastDays = Math.min(days, Math.max(0, LDate.daysBetween(mStart, todayIso)));
+    let actualHours = 0;
+    if (pastDays > 0 && actual.size) {
+      for (let k = 0; k < pastDays; k++) actualHours += actual.get(LDate.plusDays(mStart, k)) || 0;
+    }
+    const futureDays = days - pastDays;
 
-    const job = jobSavings(i) * f1;
-    const ddHours = doordashHoursPerDay * days;
-    let doordash = ddHours * f1 * C.DOORDASH_RATE_US;
+    const landedBy = landingIso != null && !LDate.isAfter(landingIso, mStart) ? landingIso : null;
+    let job = 0;
+    let doordash;
     let business = 0;
     let living = 0;
     let runRate = 0;
-    if (f2 > 0 && landingIso != null) {
-      const daysSinceLandingAtStart = LDate.daysBetween(landingIso, start);
-      const p2StartOffset = days * f1;
-      const p2MidOffset = p2StartOffset + (days - p2StartOffset) / 2.0;
-      runRate = businessRunRate((daysSinceLandingAtStart + p2MidOffset) / C.DAYS_PER_MONTH);
-      const runRateAtP2Start = businessRunRate((daysSinceLandingAtStart + p2StartOffset) / C.DAYS_PER_MONTH);
-      business = (runRate / 12.0) * C.BUSINESS_TAKE_HOME * f2;
-      living = -C.LIVING_COSTS_CA * f2;
-      if (runRateAtP2Start < C.DOORDASH_STOP_RUN_RATE) doordash += ddHours * f2 * C.DOORDASH_RATE_CA;
+    if (landedBy == null) {
+      job = jobSavings(i);
+      doordash = (actualHours + futureDays * doordashPhase1HoursPerDay) * C.DOORDASH_RATE_US;
+    } else {
+      runRate = businessRunRate(LDate.monthsBetween(landedBy, mStart));
+      business = (runRate / 12.0) * C.BUSINESS_TAKE_HOME;
+      living = -C.LIVING_COSTS_CA;
+      doordash = stops && runRate >= C.DOORDASH_STOP_RUN_RATE ? 0 : (actualHours + futureDays * p2) * C.DOORDASH_RATE_CA;
     }
     let emi = 0;
-    if (emiFrom != null && !LDate.isBefore(start, emiFrom) && emiPaid < C.INDIA_HOUSE_EMI_MONTHS) {
+    if (emiEnabled && emiFrom != null && !LDate.isBefore(mStart, emiFrom) && emiPaid < C.INDIA_HOUSE_EMI_MONTHS) {
       emi = -C.INDIA_HOUSE_EMI;
       emiPaid++;
     }
     const net = job + doordash + business + living + emi;
 
+    pool = poolStart + net;
     const fundedNow = [];
-    let threshold = 0;
-    while (nextGoal < GOALS.length) {
+    while (nextGoal < GOALS.length && pool + 1e-9 >= GOALS[nextGoal].amount) {
       const g = GOALS[nextGoal];
-      threshold += g.amount;
-      if (poolStart + net + 1e-9 < threshold) break;
-      const f = net > 0 ? Math.min(1, Math.max(0, (threshold - poolStart) / net)) : 0;
-      fundedOn[nextGoal] = LDate.plusDays(start, Math.round(f * days));
+      pool -= g.amount;
+      fundedOn[nextGoal] = mEnd;
       fundedNow.push(g.key);
-      if (g.key === 'india_house') emiFrom = end;
+      if (g.key === 'india_house') emiFrom = mEnd;
       nextGoal++;
     }
-    let fundedAmount = 0;
-    for (const k of fundedNow) fundedAmount += GOALS.find((g) => g.key === k).amount;
-    pool = poolStart + net - fundedAmount;
 
     ledger.push({
-      index: i, start, end, phase1Fraction: f1, businessRunRate: runRate,
+      index: i, start: mStart, end: mEnd, phase1Fraction: landedBy == null ? 1.0 : 0.0, businessRunRate: runRate,
       jobSavings: job, doordash, business, living, emi, partnerTuition: -partner,
       net, poolStart, poolEnd: pool, funded: fundedNow,
     });
@@ -335,7 +419,11 @@ export function simulate(todayIso, landingIso, doordashHoursPerDay, startingPool
   const partnerTuitionPaidOff =
     debits.length && debits.length * C.PARTNER_TUITION_DEBIT >= C.PARTNER_TUITION_TOTAL ? debits[debits.length - 1] : null;
   return {
-    goals: GOALS.map((g, idx) => ({ key: g.key, label: g.label, amount: g.amount, fundedOn: fundedOn[idx] })),
+    goals: GOALS.map((g, idx) => ({
+      key: g.key, label: g.label, amount: g.amount, fundedOn: fundedOn[idx],
+      planDate: PLAN_DATES[g.key],
+      planDeltaDays: fundedOn[idx] == null ? null : LDate.daysBetween(PLAN_DATES[g.key], fundedOn[idx]),
+    })),
     partnerTuitionDebits: debits,
     partnerTuitionPaidOff,
     ledger,
@@ -343,30 +431,52 @@ export function simulate(todayIso, landingIso, doordashHoursPerDay, startingPool
 }
 
 // ---------------------------------------------------------------------------------------------
-// Loss
+// Loss: per-day accrual at 23:59, never repaid
 // ---------------------------------------------------------------------------------------------
-export function skippedFrenchHours(trackingStartIso, todayIso, banked) {
+export function skippedFrenchHours(entries, trackingStartIso, todayIso, zone) {
   if (trackingStartIso == null) return 0;
-  const completeDays = Math.max(0, LDate.daysBetween(trackingStartIso, todayIso));
-  return Math.max(0, completeDays * Constants.DAILY_FRENCH_TARGET - banked);
+  if (LDate.daysBetween(trackingStartIso, todayIso) <= 0) return 0;
+  const byDay = hoursByLocalDate(entries, 'FRENCH', zone);
+  let skipped = 0;
+  let d = trackingStartIso;
+  while (LDate.isBefore(d, todayIso)) {
+    skipped += Math.max(0, Constants.DAILY_FRENCH_TARGET - (byDay.get(d) || 0));
+    d = LDate.plusDays(d, 1);
+  }
+  return skipped;
 }
 
 // ---------------------------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------------------------
 export function project(rawEntries, now, zone, trackingStartIso = null) {
+  const C = Constants;
   const nowMs = toMs(now);
   const entries = rawEntries.map(normEntry);
   const today = localDate(nowMs, zone);
+  const start = trackingStartIso ?? firstLogDate(entries, zone) ?? today;
   const banked = totalHours(entries, 'FRENCH');
-  const frenchRate = trailingDailyRate(entries, 'FRENCH', nowMs);
-  const doordashRate = trailingDailyRate(entries, 'DOORDASH', nowMs);
+  const fp = frenchPace(entries, nowMs, start, today);
   const remaining = remainingHours(banked);
-  const nclc7 = projectedNclc7(today, remaining, frenchRate);
+  const nclc7 = projectedNclc7(today, remaining, fp.hoursPerDay);
   const landing = projectedLanding(nclc7);
-  const sim = simulate(today, landing, doordashRate);
-  const start = trackingStartIso ?? firstLogDate(entries, zone);
-  const skipped = skippedFrenchHours(start, today, banked);
+  const dashP1 = doordashPace(entries, nowMs, start, today, C.DOORDASH_SEED_HOURS_PER_WEEK_PHASE1);
+  const landed = landing != null && !LDate.isAfter(landing, today);
+  const seed2 = C.DOORDASH_SEED_HOURS_PER_WEEK_PHASE2 / 7.0;
+  const dashP2 = landed
+    ? doordashPace(entries, nowMs, start, today, C.DOORDASH_SEED_HOURS_PER_WEEK_PHASE2)
+    : { hoursPerDay: seed2, actualHoursInWindow: 0, dataDays: 0, windowDays: C.DOORDASH_PACE_WINDOW_DAYS, seedHoursPerDay: seed2, isPureSeed: true, isPureActual: false, actualHoursPerDay: 0 };
+  const sim = simulate(start, landing, dashP1.hoursPerDay, {
+    doordashPhase2HoursPerDay: dashP2.hoursPerDay,
+    today,
+    actualDoordashHoursByDate: hoursByLocalDate(entries, 'DOORDASH', zone),
+  });
+  const skipped = skippedFrenchHours(entries, start, today, zone);
+  const todayFrench = hoursOn(entries, 'FRENCH', today, zone);
+  const pending = Math.max(0, C.DAILY_FRENCH_TARGET - todayFrench);
+  const remainingToday = Math.max(0, C.DAILY_FRENCH_TARGET - todayFrench);
+  const wakingRemaining = Gaps.wakingHoursRemaining(nowMs, zone);
+  const partnerPlanDate = PLAN_DATES[C.PLAN_KEY_PARTNER];
   return {
     today,
     computedAt: nowMs,
@@ -374,98 +484,122 @@ export function project(rawEntries, now, zone, trackingStartIso = null) {
     trackingStart: start,
     frenchHoursBanked: banked,
     frenchHoursRemaining: remaining,
-    frenchTrailingDailyRate: frenchRate,
-    doordashTrailingDailyRate: doordashRate,
-    todayFrenchHours: hoursOn(entries, 'FRENCH', today, zone),
+    frenchPace: fp,
+    doordashPace: dashP1,
+    doordashPhase2Pace: dashP2,
+    frenchTrailingDailyRate: fp.hoursPerDay,
+    doordashTrailingDailyRate: dashP1.hoursPerDay,
+    frenchBasisLabel: frenchBasisLabel(fp),
+    todayFrenchHours: todayFrench,
     todayDoordashHours: hoursOn(entries, 'DOORDASH', today, zone),
     projectedNclc7: nclc7,
     projectedLanding: landing,
     goals: sim.goals,
     partnerTuitionDebits: sim.partnerTuitionDebits,
     partnerTuitionPaidOff: sim.partnerTuitionPaidOff,
+    partnerTuitionPlanDate: partnerPlanDate,
+    partnerTuitionPlanDeltaDays: sim.partnerTuitionPaidOff == null ? null : LDate.daysBetween(partnerPlanDate, sim.partnerTuitionPaidOff),
     skippedFrenchHours: skipped,
-    cumulativeLoss: skipped * Constants.COST_PER_SKIPPED_FRENCH_HOUR,
-    year30Loss: skipped * Constants.YEAR_30_NET_WORTH_PER_HOUR,
+    cumulativeLoss: skipped * C.COST_PER_SKIPPED_FRENCH_HOUR,
+    closingCumulativeLoss: (skipped + pending) * C.COST_PER_SKIPPED_FRENCH_HOUR,
+    year30Loss: skipped * C.YEAR_30_NET_WORTH_PER_HOUR,
+    todayPendingSkippedHours: pending,
+    frenchTargetToday: C.DAILY_FRENCH_TARGET,
+    frenchHoursRemainingToday: remainingToday,
+    wakingHoursRemaining: wakingRemaining,
+    dayIsUnrecoverable: remainingToday > wakingRemaining,
     lastLogAt: lastLogAt(entries),
     ledger: sim.ledger,
   };
 }
 
-/** `goal_dates` JSON exactly as the Kotlin engine writes it into `snapshots`. */
+/** `goal_dates` JSON exactly as the Kotlin engine writes it into `snapshots` (includes the model tag). */
 export function snapshotGoalDates(p) {
   const out = {};
   for (const g of p.goals) out[g.key] = g.fundedOn;
   out[KEY_PARTNER] = p.partnerTuitionPaidOff;
   out[KEY_NCLC7] = p.projectedNclc7;
   out[KEY_LANDING] = p.projectedLanding;
+  out[KEY_MODEL] = Constants.MODEL_VERSION;
   return out;
 }
 
-/** A full `snapshots` row (snake_case, as PostgREST expects) for the projection. */
-export function toSnapshotRow(p, takenAtMs = p.computedAt) {
+/** A full `snapshots` row (snake_case, as PostgREST expects). `closing` records the 23:59 close. */
+export function toSnapshotRow(p, takenAtMs = p.computedAt, closing = false) {
   return {
     taken_at: new Date(takenAtMs).toISOString(),
     french_hours_banked: p.frenchHoursBanked,
     projected_landing: p.projectedLanding,
     goal_dates: snapshotGoalDates(p),
-    cumulative_loss: p.cumulativeLoss,
+    cumulative_loss: closing ? p.closingCumulativeLoss : p.cumulativeLoss,
   };
 }
 
 // ---------------------------------------------------------------------------------------------
-// Deltas
+// Deltas and baselines (signed integers; presentation is the UI's job)
 // ---------------------------------------------------------------------------------------------
 function dateDelta(key, label, current, baseline) {
   const days = current != null && baseline != null ? LDate.daysBetween(baseline, current) : null;
   const toNever = current == null && baseline != null;
   const fromNever = current != null && baseline == null;
+  return { key, label, current, baseline, days, toNever, fromNever, slipped: toNever || (days ?? 0) > 0, improved: fromNever || (days ?? 0) < 0 };
+}
+
+/** `baseline` is a `snapshots` row (snake_case). `kind` is 'INSTALL' or 'MONDAY'. */
+export function compare(p, baseline, kind) {
+  const gd = baseline.goal_dates ?? {};
+  const goals = p.goals.map((g) => dateDelta(g.key, g.label, g.fundedOn, gd[g.key] ?? null));
+  const partner = dateDelta(KEY_PARTNER, "Partner's tuition", p.partnerTuitionPaidOff, gd[KEY_PARTNER] ?? null);
+  const nclc7 = dateDelta(KEY_NCLC7, 'NCLC 7', p.projectedNclc7, gd[KEY_NCLC7] ?? null);
+  const landing = dateDelta(KEY_LANDING, 'Canada landing', p.projectedLanding, baseline.projected_landing ?? null);
+  const ds = goals.map((g) => g.days).filter((d) => d != null);
+  let aggregateDays = 0;
+  if (ds.length) {
+    const worst = Math.max(...ds);
+    aggregateDays = worst > 0 ? worst : Math.min(...ds);
+  }
   return {
-    key, label, current, baseline, days, toNever, fromNever,
-    slipped: toNever || (days ?? 0) > 0,
-    improved: fromNever || (days ?? 0) < 0,
+    kind,
+    baselineTakenAt: new Date(toMs(baseline.taken_at)).toISOString().replace('.000Z', 'Z'),
+    goals,
+    partner,
+    nclc7,
+    landing,
+    headlineNever: goals.some((g) => g.toNever),
+    aggregateDays,
   };
 }
 
-/** `baseline` is a `snapshots` row (snake_case) or null. */
-export function compare(p, baseline) {
-  const gd = baseline?.goal_dates ?? {};
-  const goals = p.goals.map((g) => dateDelta(g.key, g.label, g.fundedOn, gd[g.key] ?? null));
-  const nclc7 = dateDelta(KEY_NCLC7, 'NCLC 7', p.projectedNclc7, gd[KEY_NCLC7] ?? null);
-  const landing = dateDelta(KEY_LANDING, 'Canada landing', p.projectedLanding, baseline?.projected_landing ?? null);
-  const hasBaseline = baseline != null;
-  const headlineNever = goals.some((g) => g.toNever);
-  let headlineDays = null;
-  if (hasBaseline) {
-    const ds = goals.map((g) => g.days).filter((d) => d != null);
-    if (ds.length) {
-      const worst = Math.max(...ds);
-      headlineDays = worst > 0 ? worst : Math.min(...ds);
-    }
-  }
-  return { baselineTakenAt: baseline?.taken_at ?? null, hasBaseline, goals, nclc7, landing, headlineNever, headlineDays };
+export function installInstantMs(installIso, zone) {
+  return zonedToMs(installIso, 12, 0, zone);
 }
 
-export function lastMonday(snapshots, todayIso, zone) {
+/** The install baseline, recomputed from the current model (nothing logged, install day noon). Never missing. */
+export function installSnapshotRow(installIso, zone) {
+  const at = installInstantMs(installIso, zone);
+  return toSnapshotRow(project([], at, zone, installIso), at);
+}
+
+/** The newest snapshot taken on a Monday (local), on/before today, not before `notBefore`, from the current model. */
+export function lastMonday(snapshots, todayIso, zone, notBefore = null, model = Constants.MODEL_VERSION) {
   let best = null;
   for (const s of snapshots) {
     const d = localDate(toMs(s.taken_at), zone);
-    if (LDate.dayOfWeek(d) === 1 && !LDate.isAfter(d, todayIso)) {
-      if (!best || toMs(s.taken_at) > toMs(best.taken_at)) best = s;
-    }
+    if (LDate.dayOfWeek(d) !== 1 || LDate.isAfter(d, todayIso)) continue;
+    if (notBefore != null && LDate.isBefore(d, notBefore)) continue;
+    if (model != null && (s.goal_dates?.[KEY_MODEL] ?? null) !== model) continue;
+    if (!best || toMs(s.taken_at) > toMs(best.taken_at)) best = s;
   }
   return best;
 }
 
-export function lastWeek(snapshots, todayIso, zone) {
-  const cutoff = LDate.plusDays(todayIso, -7);
-  let best = null;
-  let oldest = null;
-  for (const s of snapshots) {
-    const d = localDate(toMs(s.taken_at), zone);
-    if (!LDate.isAfter(d, cutoff) && (!best || toMs(s.taken_at) > toMs(best.taken_at))) best = s;
-    if (!oldest || toMs(s.taken_at) < toMs(oldest.taken_at)) oldest = s;
-  }
-  return best ?? oldest;
+export function sinceInstall(p, zone) {
+  return compare(p, installSnapshotRow(p.trackingStart, zone), 'INSTALL');
+}
+
+export function sinceMonday(p, snapshots, zone) {
+  const monday = lastMonday(snapshots, p.today, zone, p.trackingStart);
+  return monday ? compare(p, monday, 'MONDAY') : sinceInstall(p, zone);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -484,6 +618,12 @@ export const Gaps = {
     const d = localDate(ms, zone);
     const todayStart = zonedToMs(d, Constants.WAKING_START_HOUR, 0, zone);
     return ms < todayStart ? todayStart : zonedToMs(LDate.plusDays(d, 1), Constants.WAKING_START_HOUR, 0, zone);
+  },
+  /** Hours between now and 22:00 local today, floored at 0 (whole minutes). */
+  wakingHoursRemaining(ms, zone) {
+    const end = zonedToMs(localDate(ms, zone), Constants.WAKING_END_HOUR, 0, zone);
+    const minutes = Math.trunc((end - ms) / 60000);
+    return Math.max(0, minutes) / 60;
   },
   wakingMinutesBetween(lastMs, nowMs, zone) {
     if (nowMs <= lastMs) return 0;
@@ -508,7 +648,7 @@ export const Gaps = {
 };
 
 // ---------------------------------------------------------------------------------------------
-// Formatting helpers shared by the dashboard and the voice line.
+// Presentation helpers (not used by the projection). Shared by the TV page and the voice line.
 // ---------------------------------------------------------------------------------------------
 export function fmtMoney(x) {
   return '$' + Math.round(x).toLocaleString('en-US');
@@ -521,11 +661,14 @@ export function fmtDate(iso) {
   return `${d} ${months[m - 1]} ${y}`;
 }
 
+/** Signed days as "+4 d", "−2 d", "—"; "NEVER" / "back" when a date fell off or returned. */
+export function formatDeltaDays(days, toNever = false, fromNever = false) {
+  if (toNever) return 'NEVER';
+  if (fromNever) return 'back';
+  if (days == null || days === 0) return '—';
+  return days > 0 ? `+${days} d` : `−${-days} d`;
+}
+
 export function fmtDelta(delta) {
-  if (delta.toNever) return 'NEVER';
-  if (delta.fromNever) return 'back from NEVER';
-  if (delta.days == null) return '';
-  if (delta.days === 0) return 'no change';
-  const n = Math.abs(delta.days);
-  return `${delta.days > 0 ? '+' : '-'}${n} day${n === 1 ? '' : 's'}`;
+  return formatDeltaDays(delta.days, delta.toNever, delta.fromNever);
 }
