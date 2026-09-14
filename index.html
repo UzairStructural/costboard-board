@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>The Cost Board</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <main id="board" class="board" data-kiosk="0">
+
+    <!-- 1. Cumulative loss: the headline, red while any target hour is unpaid. -->
+    <section id="loss" class="loss" aria-live="polite" aria-atomic="true">
+      <p id="loss-figure" class="loss__figure num tone-red">$0</p>
+      <p id="loss-captions" class="loss__captions">
+        <span id="loss-skipped" class="loss__skipped num">0 French hours skipped</span>
+        <span id="loss-since" class="loss__since num">since —</span>
+      </p>
+    </section>
+
+    <!-- 2. The four goal dates versus Monday's snapshot, plus the partner's fixed tuition schedule. -->
+    <section id="goals" class="goals" aria-label="Goal dates versus Monday">
+      <ul id="goal-list" class="goal-list">
+        <li id="goal-brother" class="goal" data-key="brother">
+          <span class="goal__label">Brother's tuition</span>
+          <span class="goal__date num tone-neutral">—</span>
+          <span class="goal__delta num tone-muted"><span class="goal__arrow" aria-hidden="true"></span><span class="goal__delta-text"></span></span>
+        </li>
+        <li id="goal-india_house" class="goal" data-key="india_house">
+          <span class="goal__label">House in India</span>
+          <span class="goal__date num tone-neutral">—</span>
+          <span class="goal__delta num tone-muted"><span class="goal__arrow" aria-hidden="true"></span><span class="goal__delta-text"></span></span>
+        </li>
+        <li id="goal-marriage" class="goal" data-key="marriage">
+          <span class="goal__label">Marriage</span>
+          <span class="goal__date num tone-neutral">—</span>
+          <span class="goal__delta num tone-muted"><span class="goal__arrow" aria-hidden="true"></span><span class="goal__delta-text"></span></span>
+        </li>
+        <li id="goal-us_house" class="goal" data-key="us_house">
+          <span class="goal__label">House in US</span>
+          <span class="goal__date num tone-neutral">—</span>
+          <span class="goal__delta num tone-muted"><span class="goal__arrow" aria-hidden="true"></span><span class="goal__delta-text"></span></span>
+        </li>
+        <li id="goal-partner_tuition" class="goal goal--partner" data-key="partner_tuition">
+          <span class="goal__label">Partner's tuition</span>
+          <span class="goal__date num tone-muted">—</span>
+          <span class="goal__delta tone-muted">fixed schedule</span>
+        </li>
+      </ul>
+    </section>
+
+    <!-- 3. French progress: hours banked, trailing rate, exam and landing dates versus Monday. -->
+    <section id="french" class="french" aria-label="French progress">
+      <div class="french__row">
+        <span id="french-banked" class="french__banked num">0 of 1,000 h</span>
+        <span id="french-rate" class="french__rate num">0.0 h/day (7-day)</span>
+      </div>
+      <div class="french__row">
+        <span id="french-nclc7" class="french__item">
+          <span class="french__label">NCLC 7</span>
+          <span class="french__date num tone-neutral">—</span>
+          <span class="french__delta num tone-muted"><span class="french__arrow" aria-hidden="true"></span><span class="french__delta-text"></span></span>
+        </span>
+        <span id="french-landing" class="french__item">
+          <span class="french__label">Canada landing</span>
+          <span class="french__date num tone-neutral">—</span>
+          <span class="french__delta num tone-muted"><span class="french__arrow" aria-hidden="true"></span><span class="french__delta-text"></span></span>
+        </span>
+      </div>
+    </section>
+
+    <!-- 4. Weekly summary: one sentence at a time (app.js rotates through the four). -->
+    <section id="weekly" class="weekly" aria-label="Weekly summary" hidden>
+      <p id="weekly-text" class="weekly__text"></p>
+    </section>
+
+    <!-- 5. Footer: the year-30 figure (small by spec) and the connection status, grey only. -->
+    <footer id="footer" class="footer">
+      <span id="footer-year30" class="footer__year30 num">Year-30 north star: $0</span>
+      <span id="footer-status" class="footer__status">
+        <span id="status-error" class="footer__error" hidden></span>
+        <span id="status-dot" class="status-dot" role="img" aria-label="connection ok"></span>
+        <span id="footer-updated" class="footer__updated num">waiting for first update</span>
+      </span>
+    </footer>
+  </main>
+
+  <!-- Shown only when config.js is missing or blank (never in mock mode). -->
+  <div id="config-missing" class="overlay overlay--config" role="alert" hidden>
+    <p id="config-missing-text" class="overlay__text"></p>
+  </div>
+
+  <!-- Shown only when the browser's autoplay policy rejected play(); any click or key dismisses it. -->
+  <div id="voice-overlay" class="overlay overlay--voice" hidden>
+    <p class="overlay__text">Tap once to enable voice</p>
+  </div>
+
+  <audio id="voice-audio" preload="auto"></audio>
+
+  <!-- config.js is git-ignored; the mock server serves it virtually. When it is absent the page shows #config-missing. -->
+  <script src="https://zraumtpmrmzegusjeeyw.supabase.co/functions/v1/dashboard/config.js"></script>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
